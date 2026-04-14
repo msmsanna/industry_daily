@@ -1,0 +1,6 @@
+name = "siliconflow-proxy"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+# 这里可以放一些默认配置，不需要改动
