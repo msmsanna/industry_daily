@@ -6,10 +6,11 @@ const KEYS = {
   reports: 'industry_reports',
   auth: 'industry_auth',
   lastFetch: 'industry_last_fetch',
+  favourites: 'industry_favourites',
 };
 
-// 自动清理超过6个月的动态
-const SIX_MONTHS_MS = 180 * 24 * 60 * 60 * 1000;
+// 自动清理超过3个月的动态
+const THREE_MONTHS_MS = 90 * 24 * 60 * 60 * 1000;
 
 function get<T>(key: string, fallback: T): T {
   try {
@@ -55,10 +56,10 @@ export const deleteSource = (id: string): number => {
   return removedCount;
 };
 
-// Articles（带6个月自动清理）
+// Articles（带3个月自动清理）
 export const getArticles = (): Article[] => {
   const articles = get<Article[]>(KEYS.articles, []);
-  const cutoff = Date.now() - SIX_MONTHS_MS;
+  const cutoff = Date.now() - THREE_MONTHS_MS;
   return articles.filter(a => {
     try {
       return new Date(a.publishedAt).getTime() > cutoff;
@@ -96,3 +97,24 @@ export const deleteReport = (id: string): void => {
 // Last fetch time
 export const getLastFetch = (): number => get<number>(KEYS.lastFetch, 0);
 export const setLastFetch = (ts: number): void => set(KEYS.lastFetch, ts);
+
+// Favourites
+export const getFavourites = (): Article[] => get<Article[]>(KEYS.favourites, []);
+export const saveFavourites = (favourites: Article[]): void => set(KEYS.favourites, favourites);
+
+export const addFavourite = (article: Article): void => {
+  const list = getFavourites();
+  // 避免重复收藏
+  if (!list.some(a => a.id === article.id)) {
+    list.unshift(article);
+    saveFavourites(list);
+  }
+};
+
+export const removeFavourite = (id: string): void => {
+  saveFavourites(getFavourites().filter(a => a.id !== id));
+};
+
+export const isFavourited = (id: string): boolean => {
+  return getFavourites().some(a => a.id === id);
+};

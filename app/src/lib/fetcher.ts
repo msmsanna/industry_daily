@@ -1,6 +1,58 @@
 import type { Source, Article } from '../types';
-import { updateSource } from './storage';
 import { getApiBaseUrl } from './config';
+
+const apiBase = getApiBaseUrl();
+
+// ============================================================
+// Sources API（与后端数据库交互）
+// ============================================================
+
+export interface SourceResponse {
+  success: boolean;
+  data: Source[];
+}
+
+/**
+ * 获取所有信息源（从后端数据库）
+ */
+export async function fetchSources(): Promise<Source[]> {
+  const res = await fetch(`${apiBase}/sources`);
+  if (!res.ok) throw new Error(`获取信息源失败: ${res.status}`);
+  const data: SourceResponse = await res.json();
+  return data.data || [];
+}
+
+/**
+ * 添加或更新信息源到后端
+ */
+export async function saveSource(source: Source): Promise<void> {
+  const res = await fetch(`${apiBase}/sources`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: source.id,
+      name: source.name,
+      url: source.url,
+      type: source.type,
+      description: source.description,
+      tags: source.tags,
+      status: source.status,
+      createdAt: source.createdAt,
+      lastFetchedAt: source.lastFetchedAt,
+    }),
+  });
+  if (!res.ok) throw new Error(`保存信息源失败: ${res.status}`);
+}
+
+/**
+ * 删除信息源
+ */
+export async function deleteSourceApi(id: string): Promise<void> {
+  const res = await fetch(`${apiBase}/sources/${id}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(`删除信息源失败: ${res.status}`);
+}
 
 // ============================================================
 // 新闻 API（与后端 SQLite 数据库交互）
@@ -35,6 +87,22 @@ export interface NewsAllResponse {
   maxLimit: number;     // 最大限制数（100）
 }
 
+// 后端返回的新闻字段（snake_case）转换前端类型（camelCase）
+function transformArticle(article: any): Article {
+  return {
+    id: article.id,
+    sourceId: article.source_id,
+    sourceName: article.source_name,
+    title: article.title,
+    summary: article.summary,
+    url: article.url,
+    content: article.content,
+    publishedAt: article.published_at,
+    fetchedAt: article.fetched_at,
+    tags: Array.isArray(article.tags) ? article.tags : [],
+  };
+}
+
 /**
  * 获取新闻列表（分页）
  */
@@ -47,12 +115,17 @@ export async function fetchNewsList(params: NewsQueryParams): Promise<NewsListRe
   if (params.keyword) query.set('keyword', params.keyword);
   if (params.mode) query.set('mode', params.mode);
 
-  const apiBase = getApiBaseUrl();
   const res = await fetch(`${apiBase}/news?${query.toString()}`);
   if (!res.ok) {
     throw new Error(`获取新闻列表失败: ${res.status}`);
   }
-  return res.json();
+  const data = await res.json();
+  // 转换字段
+  return {
+    success: data.success,
+    data: data.data?.map(transformArticle) || [],
+    pagination: data.pagination,
+  };
 }
 
 /**
@@ -69,7 +142,16 @@ export async function fetchAllNews(params: Omit<NewsQueryParams, 'page' | 'pageS
   if (!res.ok) {
     throw new Error(`获取全部新闻失败: ${res.status}`);
   }
-  return res.json();
+  const data = await res.json();
+  // 转换字段
+  return {
+    success: data.success,
+    data: data.data?.map(transformArticle) || [],
+    total: data.total,
+    totalFiltered: data.totalFiltered,
+    truncated: data.truncated,
+    maxLimit: data.maxLimit,
+  };
 }
 
 /**
@@ -132,8 +214,8 @@ function truncate(str: string, len: number): string {
   return str.length > len ? str.slice(0, len) + '…' : str;
 }
 
-// 只保留最近3天的文章
-const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+// 只保留最近30天的文章（翻页时获取更多历史数据）
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * 直接解析 Atom/XML RSS 文本（支持 WeWe-RSS 等本地源）
@@ -149,7 +231,7 @@ function parseAtomFeed(xmlText: string, source: Source): Article[] {
   if (entries.length === 0) throw new Error('Atom Feed 中没有找到任何文章');
 
   const now = new Date().toISOString();
-  const cutoffTime = new Date(Date.now() - THREE_DAYS_MS).getTime();
+  const cutoffTime = new Date(Date.now() - THIRTY_DAYS_MS).getTime();
 
   const articles: Article[] = [];
 
@@ -242,21 +324,73 @@ export async function validateRSSUrl(url: string): Promise<{ valid: boolean; mes
 }
 
 /**
- * 抓取单个信息源的 RSS/Atom 文章列表
+ * 构建带分页的 URL
  */
-export async function fetchRSS(source: Source): Promise<Article[]> {
-  const url = source.url;
+function buildPageUrl(baseUrl: string, page: number): string {
+  const separator = baseUrl.includes('?') ? '&' : '?';
+  // WeWe-RSS 分页参数：page=1, page=2, ...
+  return `${baseUrl}${separator}page=${page}`;
+}
 
-  if (isDirectFetchable(url) || true) {
-    // 统一使用直接解析方式
-    const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
-    if (!res.ok) throw new Error(`请求失败: HTTP ${res.status}`);
-    const xmlText = await res.text();
-    return parseAtomFeed(xmlText, source);
+/**
+ * 抓取单个信息源的 RSS/Atom 文章列表（支持翻页）
+ * @param source 信息源
+ * @param maxPages 最大抓取页数，默认5页
+ */
+export async function fetchRSS(source: Source, maxPages: number = 5): Promise<Article[]> {
+  const baseUrl = source.url;
+  const allArticles: Article[] = [];
+  let hasMore = true;
+  let currentPage = 1;
+
+  while (hasMore && currentPage <= maxPages) {
+    const url = buildPageUrl(baseUrl, currentPage);
+
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+      if (!res.ok) {
+        // 如果是404或其他错误，可能没有更多页了
+        if (res.status === 404 || res.status >= 500) {
+          console.log(`[${source.name}] 页面 ${currentPage} 返回 ${res.status}，停止翻页`);
+          break;
+        }
+        throw new Error(`请求失败: HTTP ${res.status}`);
+      }
+
+      const xmlText = await res.text();
+      const articles = parseAtomFeed(xmlText, source);
+
+      if (articles.length === 0) {
+        // 没有内容了，停止翻页
+        hasMore = false;
+        console.log(`[${source.name}] 页面 ${currentPage} 无内容，停止翻页`);
+      } else {
+        allArticles.push(...articles);
+        console.log(`[${source.name}] 页面 ${currentPage} 获取 ${articles.length} 条`);
+        currentPage++;
+
+        // 如果只有1页内容，说明可能不支持分页
+        if (currentPage === 2 && articles.length < 10) {
+          hasMore = false;
+        }
+      }
+    } catch (e) {
+      // 请求出错，可能是最后一页
+      console.error(`[${source.name}] 页面 ${currentPage} 抓取失败:`, e);
+      break;
+    }
   }
 
-  // 兜底：不应该走到这里，但保留以防万一
-  throw new Error(`不支持的 RSS 源格式: ${url}`);
+  // 去除重复（根据 URL 去重）
+  const seen = new Set<string>();
+  const uniqueArticles = allArticles.filter(a => {
+    if (seen.has(a.url)) return false;
+    seen.add(a.url);
+    return true;
+  });
+
+  console.log(`[${source.name}] 共抓取 ${uniqueArticles.length} 条（去重后）`);
+  return uniqueArticles;
 }
 
 /**
@@ -278,7 +412,8 @@ export async function fetchAllActiveSources(
       if (articles.length > 0) {
         await addNews(articles);
       }
-      updateSource({ ...src, lastFetchedAt: new Date().toISOString() });
+      // 通过后端 API 更新源的抓取时间
+      await saveSource({ ...src, lastFetchedAt: new Date().toISOString() });
       success++;
     } catch (e) {
       console.error(`抓取失败 [${src.name}]:`, e);

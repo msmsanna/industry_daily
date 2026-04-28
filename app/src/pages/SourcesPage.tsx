@@ -1,8 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import type { Source } from '../types';
-import { getSources, addSource, updateSource, deleteSource, getArticles } from '../lib/storage';
-import { fetchRSS, validateRSSUrl } from '../lib/fetcher';
-import { addArticles } from '../lib/storage';
+import { fetchSources, saveSource, deleteSourceApi, fetchRSS, validateRSSUrl, addNews } from '../lib/fetcher';
 
 function generateId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -27,6 +25,7 @@ type UrlCheckState = 'idle' | 'checking' | 'ok' | 'error';
 
 export default function SourcesPage() {
   const [sources, setSources] = useState<Source[]>([]);
+  const [loading, setLoading] = useState(false);
   const [showModal, setShowModal] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<FormData>(emptyForm);
@@ -38,7 +37,21 @@ export default function SourcesPage() {
   // 自定义确认弹窗状态
   const [confirmTarget, setConfirmTarget] = useState<{ id: string; name: string; articleCount: number } | null>(null);
 
-  useEffect(() => { setSources(getSources()); }, []);
+  // 从后端加载信息源
+  const loadSources = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await fetchSources();
+      setSources(data);
+    } catch (err) {
+      console.error('加载信息源失败:', err);
+      showToast('加载信息源失败，请检查后端服务');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadSources(); }, [loadSources]);
 
   const showToast = (msg: string) => {
     setToast(msg);
@@ -86,32 +99,54 @@ export default function SourcesPage() {
 
   const handleRemoveTag = (tag: string) => setForm(f => ({ ...f, tags: f.tags.filter(t => t !== tag) }));
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!form.name.trim() || !form.url.trim()) return;
+
     if (editingId) {
+      // 更新现有源
       const src = sources.find(s => s.id === editingId)!;
-      updateSource({ ...src, name: form.name, url: form.url, type: form.type, description: form.description, tags: form.tags });
+      await saveSource({
+        ...src,
+        name: form.name,
+        url: form.url,
+        type: form.type,
+        description: form.description,
+        tags: form.tags,
+      });
+      showToast('信息源已更新');
     } else {
-      const newSrc: Source = { id: generateId(), name: form.name, url: form.url, type: form.type, description: form.description, tags: form.tags, status: 'inactive', createdAt: new Date().toISOString() };
-      addSource(newSrc);
+      // 新增
+      const newSrc: Source = {
+        id: generateId(),
+        name: form.name,
+        url: form.url,
+        type: form.type,
+        description: form.description,
+        tags: form.tags,
+        status: 'inactive',
+        createdAt: new Date().toISOString(),
+      };
+      await saveSource(newSrc);
+      showToast('信息源已添加');
     }
-    setSources(getSources());
+
     setShowModal(false);
-    showToast(editingId ? '信息源已更新' : '信息源已添加');
+    loadSources(); // 刷新列表
   };
 
   const handleToggleStatus = async (src: Source) => {
     const newStatus = src.status === 'active' ? 'inactive' : 'active';
-    updateSource({ ...src, status: newStatus });
-    setSources(getSources());
+    await saveSource({ ...src, status: newStatus });
+
     if (newStatus === 'active') {
       showToast(`已启用「${src.name}」，正在抓取数据…`);
       setFetchingId(src.id);
       try {
         const articles = await fetchRSS({ ...src, status: 'active' });
-        addArticles(articles);
-        updateSource({ ...src, status: 'active', lastFetchedAt: new Date().toISOString() });
-        setSources(getSources());
+        if (articles.length > 0) {
+          await addNews(articles);
+        }
+        await saveSource({ ...src, status: 'active', lastFetchedAt: new Date().toISOString() });
         showToast(`「${src.name}」抓取完成，新增 ${articles.length} 条动态`);
       } catch (e: unknown) {
         showToast(`抓取失败: ${e instanceof Error ? e.message : '未知错误'}`);
@@ -119,27 +154,52 @@ export default function SourcesPage() {
     } else {
       showToast(`已停用「${src.name}」`);
     }
+
+    loadSources(); // 刷新列表
   };
 
-  // 触发删除确认弹窗（不再使用 window.confirm）
-  const handleDeleteClick = (id: string) => {
+  // 触发删除确认弹窗
+  const handleDeleteClick = async (id: string) => {
     const name = sources.find(s => s.id === id)?.name || '';
-    // 统计该信息源关联的历史动态数量
-    const articleCount = getArticles().filter(a => a.sourceId === id).length;
+    // 查询关联的动态数量（通过后端）
+    let articleCount = 0;
+    try {
+      const res = await fetch(`/api/news?source_id=${id}&pageSize=1`);
+      if (res.ok) {
+        const data = await res.json();
+        articleCount = data.pagination?.total || 0;
+      }
+    } catch { /* ignore */ }
     setConfirmTarget({ id, name, articleCount });
   };
 
   // 确认删除
-  const handleConfirmDelete = () => {
+  const handleConfirmDelete = async () => {
     if (!confirmTarget) return;
-    const removedCount = deleteSource(confirmTarget.id);
-    setSources(getSources());
-    showToast(`信息源已删除，同时清理了 ${removedCount} 条关联动态`);
-    setConfirmTarget(null);
+    try {
+      await deleteSourceApi(confirmTarget.id);
+      showToast(`信息源已删除`);
+      setConfirmTarget(null);
+      loadSources(); // 刷新列表
+    } catch (err) {
+      showToast('删除失败');
+    }
   };
 
   const canSave = form.name.trim() && form.url.trim();
   const urlInputClass = `input ${urlCheck.state === 'ok' ? '!border-green-500' : urlCheck.state === 'error' ? '!border-red-500' : ''}`;
+
+  if (loading) {
+    return (
+      <div className="p-6 max-w-5xl mx-auto flex items-center justify-center py-16">
+        <svg className="animate-spin w-8 h-8 text-indigo-500" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+        </svg>
+        <span className="ml-3 text-slate-400">加载中…</span>
+      </div>
+    );
+  }
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -210,7 +270,7 @@ export default function SourcesPage() {
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex flex-wrap gap-1">
-                      {src.tags.map(t => (
+                      {(src.tags || []).map(t => (
                         <span key={t} className="badge" style={{ backgroundColor: 'rgba(100,116,139,0.3)', color: '#94a3b8' }}>{t}</span>
                       ))}
                     </div>
@@ -248,7 +308,6 @@ export default function SourcesPage() {
                         {src.status === 'active' ? '停用' : '启用'}
                       </button>
                       <button type="button" onClick={() => openEdit(src)} className="btn btn-secondary" style={{ fontSize: 12, padding: '4px 10px' }}>编辑</button>
-                      {/* 关键修复：type="button" + 不使用 window.confirm */}
                       <button
                         type="button"
                         onClick={() => handleDeleteClick(src.id)}
@@ -276,32 +335,22 @@ export default function SourcesPage() {
         <div
           className="fixed inset-0 z-[90] flex items-center justify-center"
           style={{ backgroundColor: 'rgba(0,0,0,0.7)' }}
-          onClick={() => setConfirmTarget(null)} // 点击遮罩取消
+          onClick={() => setConfirmTarget(null)}
         >
           <div
             className="bg-slate-800 border border-slate-600 rounded-2xl shadow-2xl w-full max-w-sm mx-4 overflow-hidden"
-            onClick={e => e.stopPropagation()} // 阻止冒泡
+            onClick={e => e.stopPropagation()}
           >
-            {/* 弹窗头部 */}
             <div className="px-6 pt-6 pb-4">
               <div className="flex items-center gap-3 mb-2">
-                <div style={{
-                  width: 40, height: 40, borderRadius: '50%',
-                  backgroundColor: 'rgba(239,68,68,0.15)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  flexShrink: 0,
-                }}>
+                <div style={{ width: 40, height: 40, borderRadius: '50%', backgroundColor: 'rgba(239,68,68,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                   <svg style={{ width: 20, height: 20, color: '#f87171' }} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                   </svg>
                 </div>
-                <div>
-                  <h3 className="text-base font-semibold text-slate-100">确认删除</h3>
-                  <p className="text-sm text-slate-400 mt-0.5">此操作不可撤销</p>
-                </div>
+                <div><h3 className="text-base font-semibold text-slate-100">确认删除</h3><p className="text-sm text-slate-400 mt-0.5">此操作不可撤销</p></div>
               </div>
             </div>
-            {/* 弹窗内容 */}
             <div className="px-6 pb-4">
               <div className="bg-slate-900/60 rounded-xl p-4 mb-5 border border-slate-700/50">
                 <p className="text-sm text-slate-300">
@@ -311,28 +360,9 @@ export default function SourcesPage() {
                 </p>
               </div>
             </div>
-            {/* 弹窗按钮 */}
             <div className="flex gap-2 px-6 pb-6">
-              <button
-                type="button"
-                onClick={() => setConfirmTarget(null)}
-                className="btn btn-secondary flex-1 justify-center py-2.5"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmDelete}
-                className="btn flex-1 justify-center py-2.5"
-                style={{
-                  backgroundColor: 'rgba(239,68,68,0.85)',
-                  color: '#ffffff',
-                  border: '1px solid rgba(239,68,68,0.5)',
-                  fontWeight: 600,
-                }}
-              >
-                确认删除
-              </button>
+              <button type="button" onClick={() => setConfirmTarget(null)} className="btn btn-secondary flex-1 justify-center py-2.5">取消</button>
+              <button type="button" onClick={handleConfirmDelete} className="btn flex-1 justify-center py-2.5" style={{ backgroundColor: 'rgba(239,68,68,0.85)', color: '#ffffff', border: '1px solid rgba(239,68,68,0.5)', fontWeight: 600 }}>确认删除</button>
             </div>
           </div>
         </div>
@@ -344,9 +374,7 @@ export default function SourcesPage() {
             <div className="flex items-center justify-between px-6 py-4 border-b border-slate-700">
               <h3 className="text-base font-semibold text-slate-100">{editingId ? '编辑信息源' : '新增信息源'}</h3>
               <button type="button" onClick={() => setShowModal(false)} className="btn btn-ghost p-1.5 rounded-full text-slate-400 hover:text-slate-200 hover:bg-slate-700">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
               </button>
             </div>
             <div className="p-6 space-y-4">
@@ -358,43 +386,15 @@ export default function SourcesPage() {
                 <label className="block text-sm font-medium text-slate-300 mb-1">RSS地址 *</label>
                 <div className="flex gap-2">
                   <div className="flex-1 relative">
-                    <input
-                      className={urlInputClass}
-                      placeholder="https://example.com/feed"
-                      value={form.url}
-                      onChange={e => handleUrlChange(e.target.value)}
-                    />
-                    <button
-                      type="button"
-                      onClick={handleCheckUrl}
-                      disabled={urlCheck.state === 'checking' || !form.url.trim() || urlCheckLock}
-                      style={{
-                        position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
-                        fontSize: 12, padding: '3px 10px', borderRadius: 6,
-                        backgroundColor: 'rgba(59,130,246,0.2)', color: '#60a5fa', border: '1px solid rgba(59,130,246,0.3)',
-                        cursor: (!form.url.trim() || urlCheckLock) ? 'not-allowed' : 'pointer',
-                        opacity: (!form.url.trim() || urlCheckLock) ? 0.5 : 1,
-                      }}
-                    >
+                    <input className={urlInputClass} placeholder="https://example.com/feed" value={form.url} onChange={e => handleUrlChange(e.target.value)} />
+                    <button type="button" onClick={handleCheckUrl} disabled={urlCheck.state === 'checking' || !form.url.trim() || urlCheckLock} style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', fontSize: 12, padding: '3px 10px', borderRadius: 6, backgroundColor: 'rgba(59,130,246,0.2)', color: '#60a5fa', border: '1px solid rgba(59,130,246,0.3)', cursor: (!form.url.trim() || urlCheckLock) ? 'not-allowed' : 'pointer', opacity: (!form.url.trim() || urlCheckLock) ? 0.5 : 1 }}>
                       {urlCheck.state === 'checking' ? '验证中…' : '验证'}
                     </button>
                   </div>
                 </div>
-                {urlCheck.state === 'ok' && (
-                  <p className="text-xs mt-1 flex items-center gap-1" style={{ color: '#4ade80' }}>
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                    {urlCheck.msg}
-                  </p>
-                )}
-                {urlCheck.state === 'error' && (
-                  <p className="text-xs mt-1 flex items-center gap-1" style={{ color: '#f87171' }}>
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                    {urlCheck.msg}
-                  </p>
-                )}
-                {urlCheck.state === 'idle' && (
-                  <p className="text-xs text-slate-500 mt-1">填写后点击「验证」检查链接是否可用</p>
-                )}
+                {urlCheck.state === 'ok' && (<p className="text-xs mt-1 flex items-center gap-1" style={{ color: '#4ade80' }}><svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>{urlCheck.msg}</p>)}
+                {urlCheck.state === 'error' && (<p className="text-xs mt-1 flex items-center gap-1" style={{ color: '#f87171' }}><svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>{urlCheck.msg}</p>)}
+                {urlCheck.state === 'idle' && (<p className="text-xs text-slate-500 mt-1">填写后点击「验证」检查链接是否可用</p>)}
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-300 mb-1">类型</label>
@@ -409,31 +409,17 @@ export default function SourcesPage() {
               <div>
                 <label className="block text-sm font-medium text-slate-300 mb-1">标签</label>
                 <div className="flex gap-2">
-                  <input
-                    className="input flex-1"
-                    placeholder="输入标签后按回车"
-                    value={form.tagInput}
-                    onChange={e => setForm(f => ({ ...f, tagInput: e.target.value }))}
-                    onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), handleAddTag())}
-                  />
+                  <input className="input flex-1" placeholder="输入标签后按回车" value={form.tagInput} onChange={e => setForm(f => ({ ...f, tagInput: e.target.value }))} onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), handleAddTag())} />
                   <button type="button" className="btn btn-secondary" onClick={handleAddTag}>添加</button>
                 </div>
                 <div className="flex flex-wrap gap-1.5 mt-2">
-                  {form.tags.map(t => (
-                    <span key={t} className="badge flex items-center gap-1 pr-1" style={{ backgroundColor: 'rgba(59,130,246,0.15)', color: '#60a5fa' }}>
-                      {t}
-                      <button type="button" onClick={() => handleRemoveTag(t)} className="text-blue-400 hover:text-blue-200 leading-none">×</button>
-                    </span>
-                  ))}
+                  {form.tags.map(t => (<span key={t} className="badge flex items-center gap-1 pr-1" style={{ backgroundColor: 'rgba(59,130,246,0.15)', color: '#60a5fa' }}>{t}<button type="button" onClick={() => handleRemoveTag(t)} className="text-blue-400 hover:text-blue-200 leading-none">×</button></span>))}
                 </div>
               </div>
             </div>
             <div className="flex justify-end gap-2 px-6 pb-5">
               <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>取消</button>
-              <button type="button" className="btn btn-primary" onClick={handleSave}
-                style={{ opacity: canSave ? 1 : 0.5, cursor: canSave ? 'pointer' : 'not-allowed' }}>
-                {editingId ? '保存修改' : '添加信息源'}
-              </button>
+              <button type="button" className="btn btn-primary" onClick={handleSave} style={{ opacity: canSave ? 1 : 0.5, cursor: canSave ? 'pointer' : 'not-allowed' }}>{editingId ? '保存修改' : '添加信息源'}</button>
             </div>
           </div>
         </div>

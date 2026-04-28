@@ -8,6 +8,11 @@
  *   const articles = await db.getArticles({ page: 1, pageSize: 20 });
  */
 
+// ESM imports（替代 require）
+import path from 'node:path';
+import fs from 'node:fs';
+import initSqlJs from 'sql.js';
+
 // ============================================
 // 类型定义
 // ============================================
@@ -23,6 +28,22 @@ export interface Article {
   published_at: string; // ISO string
   fetched_at: string;    // ISO string
   tags?: string[];       // JSON array
+}
+
+// ============================================
+// Sources 类型
+// ============================================
+
+export interface Source {
+  id: string;
+  name: string;
+  url: string;
+  type: string;
+  description: string;
+  tags: string[];
+  status: 'active' | 'inactive';
+  created_at: string;
+  last_fetched_at?: string | null;
 }
 
 export interface GetArticlesOptions {
@@ -53,6 +74,12 @@ export interface Database {
   deleteArticle(id: string): Promise<void>;
   cleanupOlderThan(days: number): Promise<number>;
 
+  // Sources CRUD
+  getSources(): Promise<Source[]>;
+  getSourceById(id: string): Promise<Source | null>;
+  upsertSource(source: Source): Promise<void>;
+  deleteSource(id: string): Promise<void>;
+
   // 健康检查
   health(): Promise<boolean>;
 }
@@ -68,10 +95,8 @@ class SQLiteDatabase implements Database {
   async init(dbPath?: string) {
     if (this.initialized) return;
 
-    const path = require('path');
-    const fs = require('fs');
     const DB_PATH = dbPath || process.env.DB_PATH ||
-      path.join(process.cwd(), '..', 'server', 'data', 'news.db');
+      path.join(process.cwd(), 'data', 'news.db');
 
     // 确保 data 目录存在
     const dataDir = path.dirname(DB_PATH);
@@ -80,7 +105,6 @@ class SQLiteDatabase implements Database {
     }
 
     try {
-      const initSqlJs = require('sql.js');
       const SQL = await initSqlJs();
 
       if (fs.existsSync(DB_PATH)) {
@@ -92,7 +116,7 @@ class SQLiteDatabase implements Database {
         console.log(`[SQLite] 创建新数据库`);
       }
 
-      // 创建表和索引
+      // 创建 news 表和索引
       this.db.run(`
         CREATE TABLE IF NOT EXISTS news (
           id TEXT PRIMARY KEY,
@@ -110,6 +134,21 @@ class SQLiteDatabase implements Database {
       this.db.run('CREATE INDEX IF NOT EXISTS idx_news_published_at ON news(published_at)');
       this.db.run('CREATE INDEX IF NOT EXISTS idx_news_source_id ON news(source_id)');
 
+      // 创建 sources 表
+      this.db.run(`
+        CREATE TABLE IF NOT EXISTS sources (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          url TEXT NOT NULL UNIQUE,
+          type TEXT NOT NULL DEFAULT 'RSS Feed',
+          description TEXT DEFAULT '',
+          tags TEXT DEFAULT '[]',
+          status TEXT NOT NULL DEFAULT 'inactive',
+          created_at TEXT NOT NULL,
+          last_fetched_at TEXT
+        )
+      `);
+
       // 定期保存
       setInterval(() => this.saveToFile(), 30000);
 
@@ -124,10 +163,8 @@ class SQLiteDatabase implements Database {
   saveToFile() {
     if (!this.db) return;
     try {
-      const path = require('path');
-      const fs = require('fs');
       const DB_PATH = process.env.DB_PATH ||
-        path.join(process.cwd(), '..', 'server', 'data', 'news.db');
+        path.join(process.cwd(), 'data', 'news.db');
       const data = this.db.export();
       const buffer = Buffer.from(data);
       fs.writeFileSync(DB_PATH, buffer);
@@ -279,6 +316,57 @@ class SQLiteDatabase implements Database {
     this.db.run('DELETE FROM news WHERE published_at < ?', [cutoff.toISOString()]);
     this.saveToFile();
     return this.db.getRowsModified() || 0;
+  }
+
+  // ========== Sources CRUD ==========
+  async getSources(): Promise<Source[]> {
+    this.ensureInit();
+    const stmt = this.db.prepare('SELECT * FROM sources ORDER BY created_at DESC');
+    const sources: Source[] = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      let tags: string[] = [];
+      try { tags = row.tags ? JSON.parse(row.tags) : []; } catch { tags = []; }
+      sources.push({
+        id: row.id,
+        name: row.name,
+        url: row.url,
+        type: row.type || 'RSS Feed',
+        description: row.description || '',
+        tags,
+        status: row.status || 'inactive',
+        created_at: row.created_at,
+        last_fetched_at: row.last_fetched_at || null,
+      });
+    }
+    stmt.free();
+    return sources;
+  }
+
+  async getSourceById(id: string): Promise<Source | null> {
+    const sources = await this.getSources();
+    return sources.find(s => s.id === id) || null;
+  }
+
+  upsertSource(source: Source): void {
+    this.ensureInit();
+    this.db.run(`
+      INSERT OR REPLACE INTO sources (id, name, url, type, description, tags, status, created_at, last_fetched_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      source.id, source.name, source.url, source.type, source.description || '',
+      Array.isArray(source.tags) ? JSON.stringify(source.tags) : '[]',
+      source.status || 'inactive', source.created_at, source.last_fetched_at || null,
+    ]);
+    this.saveToFile();
+  }
+
+  deleteSource(id: string): void {
+    this.ensureInit();
+    // 同时删除关联的新闻
+    this.db.run('DELETE FROM news WHERE source_id = ?', [id]);
+    this.db.run('DELETE FROM sources WHERE id = ?', [id]);
+    this.saveToFile();
   }
 
   async health(): Promise<boolean> {

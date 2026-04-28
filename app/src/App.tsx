@@ -6,34 +6,25 @@ import Layout from './components/Layout';
 import ArticlesPage from './pages/ArticlesPage';
 import SourcesPage from './pages/SourcesPage';
 import ReportsPage from './pages/ReportsPage';
-
-// Seed default 36kr source if empty
-import { getSources, addSource } from './lib/storage';
-import type { Source } from './types';
-
-function seedDefaultSource() {
-  const sources = getSources();
-  if (sources.length === 0) {
-    const defaultSource: Source = {
-      id: 'default_36kr',
-      name: '36氪',
-      url: 'https://www.36kr.com/feed',
-      type: 'RSS Feed',
-      tags: ['科技', '创业', '投资'],
-      description: '36氪是专注创业创新领域的媒体平台',
-      status: 'inactive',
-      createdAt: new Date().toISOString(),
-    };
-    addSource(defaultSource);
-  }
-}
+import FavouritesPage from './pages/FavouritesPage';
+import ConfigPage from './pages/ConfigPage';
 
 export default function App() {
-  const [loggedIn, setLoggedIn] = useState(isLoggedIn());
+  const [loggedIn, setLoggedIn] = useState(() => isLoggedIn());
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    seedDefaultSource();
+    const timer = setTimeout(() => setReady(true), 100);
+    return () => clearTimeout(timer);
   }, []);
+
+  if (!ready) {
+    return (
+      <div style={{ minHeight: '100vh', backgroundColor: '#0f172a', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 18 }}>
+        正在加载...
+      </div>
+    );
+  }
 
   if (!loggedIn) {
     return <LoginPage onLogin={() => setLoggedIn(true)} />;
@@ -45,8 +36,10 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/articles" replace />} />
           <Route path="/articles" element={<ArticlesPage />} />
+          <Route path="/favourites" element={<FavouritesPage />} />
           <Route path="/sources" element={<SourcesPage />} />
           <Route path="/reports" element={<ReportsPage />} />
+          <Route path="/config" element={<ConfigPage />} />
           <Route path="*" element={<Navigate to="/articles" replace />} />
         </Routes>
       </Layout>

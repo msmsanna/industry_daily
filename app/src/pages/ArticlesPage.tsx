@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { Article } from '../types';
-import { fetchNewsList, deleteNews, fetchAllActiveSources } from '../lib/fetcher';
-import { getSources } from '../lib/storage';
+import { fetchNewsList, deleteNews, fetchAllActiveSources, fetchSources } from '../lib/fetcher';
 import { format, parseISO } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
+import { addFavourite, removeFavourite, getFavourites, isFavourited } from '../lib/storage';
 
 // 统一的主按钮样式（与 SourcesPage 新增信息源按钮完全一致）
 const primaryBtnClass = 'btn btn-primary';
@@ -72,7 +72,7 @@ export default function ArticlesPage() {
   };
 
   const handleFetchAll = async () => {
-    const sources = getSources();
+    const sources = await fetchSources();
     const active = sources.filter(s => s.status === 'active');
     if (active.length === 0) { showToast('没有已启用的信息源，请先在「信息源管理」中启用'); return; }
     setFetching(true);
@@ -105,6 +105,20 @@ export default function ArticlesPage() {
       showToast('删除失败');
     }
     setConfirmTarget(null);
+  };
+
+  // 收藏/取消收藏
+  const handleToggleFavourite = (article: Article) => {
+    const favs = getFavourites();
+    if (favs.some(a => a.id === article.id)) {
+      removeFavourite(article.id);
+      showToast('已取消收藏');
+    } else {
+      addFavourite(article);
+      showToast('已添加到收藏');
+    }
+    // 强制刷新组件以更新按钮状态
+    setArticles([...articles]);
   };
 
   const formatDate = (iso: string) => {
@@ -332,6 +346,44 @@ export default function ArticlesPage() {
                     </a>
                     <p className="text-sm text-slate-400 leading-relaxed line-clamp-2">{article.summary}</p>
                   </div>
+                  {/* 收藏按钮 */}
+                  {isFavourited(article.id) ? (
+                    <button
+                      type="button"
+                      onClick={() => handleToggleFavourite(article)}
+                      style={{
+                        flexShrink: 0,
+                        fontSize: 12, padding: '4px 10px', borderRadius: 8,
+                        backgroundColor: 'rgba(236,72,153,0.15)', color: '#f472b6',
+                        border: '1px solid rgba(236,72,153,0.35)', cursor: 'pointer',
+                        transition: 'all 150ms ease',
+                      }}
+                    >
+                      取消收藏
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleToggleFavourite(article)}
+                      style={{
+                        flexShrink: 0,
+                        fontSize: 12, padding: '4px 10px', borderRadius: 8,
+                        backgroundColor: 'rgba(236,72,153,0.1)', color: '#94a3b8',
+                        border: '1px solid rgba(236,72,153,0.2)', cursor: 'pointer',
+                        transition: 'all 150ms ease',
+                      }}
+                      onMouseEnter={e => {
+                        (e.target as HTMLButtonElement).style.backgroundColor = 'rgba(236,72,153,0.15)';
+                        (e.target as HTMLButtonElement).style.color = '#f472b6';
+                      }}
+                      onMouseLeave={e => {
+                        (e.target as HTMLButtonElement).style.backgroundColor = 'rgba(236,72,153,0.1)';
+                        (e.target as HTMLButtonElement).style.color = '#94a3b8';
+                      }}
+                    >
+                      收藏
+                    </button>
+                  )}
                   {/* 删除按钮：type=button + 自定义确认弹窗 */}
                   <button
                     type="button"

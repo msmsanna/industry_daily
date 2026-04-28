@@ -280,9 +280,21 @@ export async function generateReportWithAI(
     // 为每个簇生成综合条目
     const enrichedItems = clusters.map(group => {
       const main = group.reduce((best, a) => a.title.length > best.title.length ? a : best);
+
+      // 合并该组所有文章的完整内容，供 AI 分析使用
+      const fullContent = group
+        .map(a => {
+          const title = cleanText(a.title);
+          const summary = cleanText(a.summary || '');
+          const content = cleanText(a.content || '');
+          return `[${title}]\n${summary}\n${content}`;
+        })
+        .join('\n\n---\n\n');
+
       return {
         title: cleanText(main.title),
-        description: synthesizeEventDescription(group),
+        description: synthesizeEventDescription(group), // 保留给前端展示用
+        fullContent, // 完整内容用于 AI 生成详细日报
         score: importanceScore(main),
         group,
       };
@@ -293,23 +305,41 @@ export async function generateReportWithAI(
 
     onProgress?.('preprocess', `已筛选 ${topItems.length} 条重要资讯`);
 
-    // 准备发送给 AI 的数据
+    // 准备发送给 AI 的数据（使用完整内容，生成详细日报）
     const articlesForAI = topItems.map(item => ({
       title: item.title,
-      content: item.description,
+      content: item.fullContent,
     }));
+
+    // 读取自定义 AI 配置
+    const STORAGE_KEY = 'ai_prompt_config';
+    let customConfig: any = {};
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        customConfig = JSON.parse(stored);
+      }
+    } catch {
+      // ignore
+    }
 
     // ========== 步骤2：调用后端 API ==========
     const apiBase = getApiBaseUrl();
     let response;
     try {
-      onProgress?.('ai_classify', 'AI 正在分类动态…（第1步/共2步）');
+      onProgress?.('ai_classify', 'AI 正在生成日报…');
       response = await fetch(`${apiBase}/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           articles: articlesForAI,
           dateRange: dateLabel,
+          // 传递自定义配置
+          customSystemPrompt: customConfig.systemPrompt,
+          customUserPrompt: customConfig.userPrompt,
+          model: customConfig.model,
+          temperature: customConfig.temperature,
+          maxTokens: customConfig.maxTokens,
         }),
       });
     } catch (networkError) {
@@ -338,20 +368,40 @@ export async function generateReportWithAI(
     const aiContent = data.content as string;
 
     // ========== 步骤3：解析 AI 输出，构建日报 ==========
-    
+
     onProgress?.('parsing', '正在生成日报…');
 
-    // 尝试分离摘要和要闻部分
+    // 尝试分离摘要和板块要闻部分
     let overview = '';
     let bodyContent = '';
 
-    if (aiContent.includes('【行业摘要】') && aiContent.includes('【行业要闻】')) {
+    if (aiContent.includes('【行业摘要】')) {
       const summaryStart = aiContent.indexOf('【行业摘要】') + '【行业摘要】'.length;
-      const summaryEnd = aiContent.indexOf('【行业要闻】');
-      overview = aiContent.slice(summaryStart, summaryEnd).trim();
-      bodyContent = aiContent.slice(summaryEnd + '【行业要闻】'.length).trim();
+      // 查找【板块要闻】或各板块标题
+      const sections = ['【板块要闻】', '📜 政策动态', '🔬 技术突破', '📊 市场数据', '🏢 企业动态', '🌍 项目落地', '💰 投融资'];
+      let summaryEnd = -1;
+      for (const section of sections) {
+        const idx = aiContent.indexOf(section, summaryStart);
+        if (idx !== -1 && (summaryEnd === -1 || idx < summaryEnd)) {
+          summaryEnd = idx;
+        }
+      }
+      if (summaryEnd > summaryStart) {
+        overview = aiContent.slice(summaryStart, summaryEnd).trim();
+        bodyContent = aiContent.slice(summaryEnd).trim();
+      } else {
+        // 没有找到板块标题，整个作为摘要
+        const idx = aiContent.indexOf('\n', summaryStart);
+        if (idx !== -1) {
+          overview = aiContent.slice(summaryStart, idx).trim();
+          bodyContent = aiContent.slice(idx).trim();
+        } else {
+          overview = aiContent.slice(summaryStart).trim();
+          bodyContent = '';
+        }
+      }
     } else {
-      // 如果 AI 返回格式不标准，用前几段作为摘要，其余作为正文
+      // 如果没有【行业摘要】，用前几段作为摘要
       const lines = aiContent.split('\n').filter(l => l.trim());
       if (lines.length > 3) {
         overview = lines.slice(0, 3).join('\n');

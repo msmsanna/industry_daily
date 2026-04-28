@@ -161,11 +161,68 @@ app.delete('/news/cleanup', async (req, res) => {
 });
 
 // ============================================================
-// 日报生成接口（两步 LLM 调用）
+// Sources API（信息源 CRUD）
+// ============================================================
+
+/** GET /sources - 获取所有信息源 */
+app.get('/sources', async (_req, res) => {
+  try {
+    const sources = await db.getSources();
+    res.json({ success: true, data: sources });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/** POST /sources - 添加或更新信息源 */
+app.post('/sources', async (req, res) => {
+  try {
+    const { id, name, url, type, description, tags, status, createdAt, lastFetchedAt } = req.body;
+    if (!id || !name || !url) {
+      return res.status(400).json({ success: false, error: '缺少必要字段：id, name, url' });
+    }
+    const source = {
+      id,
+      name,
+      url,
+      type: type || 'RSS Feed',
+      description: description || '',
+      tags: Array.isArray(tags) ? tags : [],
+      status: status || 'inactive',
+      created_at: createdAt || new Date().toISOString(),
+      last_fetched_at: lastFetchedAt || null,
+    };
+    db.upsertSource(source);
+    res.json({ success: true, message: '信息源已保存' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/** DELETE /sources/:id - 删除信息源及其关联动态 */
+app.delete('/sources/:id', async (req, res) => {
+  try {
+    db.deleteSource(req.params.id);
+    res.json({ success: true, message: '信息源已删除' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================
+// 日报生成接口（支持自定义 prompt）
 // ============================================================
 
 app.post('/generate', async (req, res) => {
-  const { articles, dateRange } = req.body;
+  const {
+    articles,
+    dateRange,
+    customSystemPrompt,
+    customUserPrompt,
+    model,
+    temperature,
+    maxTokens,
+  } = req.body;
 
   if (!Array.isArray(articles) || articles.length === 0) {
     return res.status(400).json({ error: '缺少 articles 参数，或 articles 为空数组' });
@@ -173,27 +230,34 @@ app.post('/generate', async (req, res) => {
 
   try {
     console.log(`[${new Date().toLocaleString('zh-CN')}] 收到请求：${articles.length} 条动态，日期：${dateRange}`);
-    console.log('--- 第一步：分类 ---');
 
-    // 第一步：分类
-    const classifyPrompt = buildClassifyPrompt(articles);
-    const classificationResult = await callAI([
-      { role: 'system', content: '你是专业的行业信息分类员。输出纯文本，不要 Markdown 格式标记。' },
-      { role: 'user', content: classifyPrompt },
-    ]);
+    // 构建用户 prompt
+    const articleTexts = articles
+      .map((a: any, i: number) => `[${i + 1}] ${a.title}\n${a.content || ''}`)
+      .join('\n\n');
 
-    console.log(`分类完成，结果长度：${classificationResult.length} 字`);
-    console.log('--- 第二步：生成总结 ---');
+    const userContent = customUserPrompt
+      .replace('{dateRange}', dateRange || '近期')
+      .replace('{articleTexts}', articleTexts)
+      .replace('{classificationResult}', '');
 
-    // 第二步：按类别总结
-    const summarizePrompt = buildSummarizePrompt(articles, classificationResult, dateRange);
-    const generatedContent = await callAI([
+    // 使用自定义 system prompt 或默认
+    const systemContent = customSystemPrompt
+      .replace('{dateRange}', dateRange || '近期')
+      .replace('{articleTexts}', articleTexts);
+
+    // 调用 AI
+    const generatedContent = await callAI(
+      [
+        { role: 'system', content: systemContent },
+        { role: 'user', content: userContent },
+      ],
       {
-        role: 'system',
-        content: '你是一个专业的行业分析师，擅长从大量行业动态中提炼核心观点，生成高质量的行业日报。输出纯文本，不要加任何 Markdown 格式标记。',
-      },
-      { role: 'user', content: summarizePrompt },
-    ]);
+        model: model || process.env.SILICONFLOW_MODEL || 'Qwen/Qwen2.5-14B-Instruct',
+        temperature: temperature || 0.7,
+        maxTokens: maxTokens || 8000,
+      }
+    );
 
     if (!generatedContent) {
       return res.status(502).json({ error: 'AI API 返回内容为空' });
@@ -204,8 +268,7 @@ app.post('/generate', async (req, res) => {
     res.json({
       success: true,
       content: generatedContent,
-      model: process.env.SILICONFLOW_MODEL || 'Qwen/Qwen2.5-7B-Instruct',
-      steps: ['classify', 'summarize'],
+      model: model || process.env.SILICONFLOW_MODEL || 'Qwen/Qwen2.5-14B-Instruct',
     });
   } catch (err: any) {
     console.error('请求失败:', err);
