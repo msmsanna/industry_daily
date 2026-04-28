@@ -19,8 +19,9 @@ export function getApiBaseUrl(): string {
   if (isLocalDev) {
     return '/api';
   }
-  // Vercel 部署时，前端和 API 同源
-  return '';
+  // 生产环境：使用自定义 API URL（由环境变量配置）
+  // 这个变量会在 Vercel 部署时设置为后端服务地址
+  return import.meta.env.VITE_API_URL || '';
 }
 
 /** 前端完整 URL */
