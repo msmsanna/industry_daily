@@ -155,6 +155,6 @@ industry_daily/
 
 MIT
 
-##wewe-rss安装链接
+## wewe-rss安装链接
 
 https://github.com/cooderl/wewe-rss
