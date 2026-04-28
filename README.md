@@ -154,3 +154,7 @@ industry_daily/
 ## License
 
 MIT
+
+##wewe-rss安装链接
+
+https://github.com/cooderl/wewe-rss
